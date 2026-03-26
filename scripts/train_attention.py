@@ -2,12 +2,11 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
+import csv
 
 from config import ATTN_CFG
-from utils.vocab import set_seed, Vocabulary
-from utils.data import load_caption_pairs, build_splits, Flickr8kDataset, CollateFn
+from utils.utils import build_dataloaders, build_splits_and_vocab
+from utils.vocab import set_seed
 from models.attention_model import ImageCaptioningAttentionModel
 from engines.attention_engine import (
     train_one_epoch_attention,
@@ -17,80 +16,31 @@ from engines.attention_engine import (
 )
 
 
+def save_training_metrics_to_csv(history, csv_path):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    fieldnames = ["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_bleu4"]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+
 def main():
     set_seed(ATTN_CFG.seed)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     os.makedirs(ATTN_CFG.save_dir, exist_ok=True)
 
-    transform = T.Compose([
-        T.Resize((ATTN_CFG.image_size, ATTN_CFG.image_size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    pairs = load_caption_pairs(ATTN_CFG.caption_file)
-    print(f"Loaded {len(pairs)} image-caption pairs")
-
-    train_samples, val_samples, test_samples = build_splits(
-        pairs,
-        seed=ATTN_CFG.seed,
-        train_split=ATTN_CFG.train_split,
-        val_split=ATTN_CFG.val_split,
-    )
-
-    if ATTN_CFG.debug_subset:
-        train_samples = train_samples[: ATTN_CFG.debug_subset]
-        val_samples = val_samples[: min(1000, len(val_samples))]
-        test_samples = test_samples[: min(1000, len(test_samples))]
-        print(
-            f"Debug subset enabled | train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}"
-        )
-
-    train_captions = [cap for _, cap in train_samples]
-
-    vocab = Vocabulary(min_freq=ATTN_CFG.min_word_freq)
-    vocab.build(train_captions)
-    print(f"Vocab size: {len(vocab)}")
-
-    train_ds = Flickr8kDataset(
-        train_samples, ATTN_CFG.image_dir, vocab, transform, ATTN_CFG.max_len
-    )
-    val_ds = Flickr8kDataset(
-        val_samples, ATTN_CFG.image_dir, vocab, transform, ATTN_CFG.max_len
-    )
-    test_ds = Flickr8kDataset(
-        test_samples, ATTN_CFG.image_dir, vocab, transform, ATTN_CFG.max_len
-    )
-    print("Built datasets")
-
-    collate_fn = CollateFn(
-        pad_idx=vocab.stoi["<pad>"],
+    train_samples, val_samples, test_samples, vocab = build_splits_and_vocab(ATTN_CFG)
+    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = build_dataloaders(
+        ATTN_CFG,
+        vocab,
+        train_samples,
+        val_samples,
+        test_samples,
         sort_by_length=True,
     )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=ATTN_CFG.batch_size,
-        shuffle=True,
-        num_workers=ATTN_CFG.num_workers,
-        collate_fn=collate_fn,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=ATTN_CFG.batch_size,
-        shuffle=False,
-        num_workers=ATTN_CFG.num_workers,
-        collate_fn=collate_fn,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=ATTN_CFG.batch_size,
-        shuffle=False,
-        num_workers=ATTN_CFG.num_workers,
-        collate_fn=collate_fn,
-    )
-    print("Built loaders")
 
     model = ImageCaptioningAttentionModel(ATTN_CFG, vocab_size=len(vocab)).to(ATTN_CFG.device)
     print("Built attention model")
@@ -99,25 +49,72 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=ATTN_CFG.lr)
 
     best_val = float("inf")
+    best_val_bleu4 = float("-inf")
+    eps = 1e-6
+    history = []
 
     for epoch in range(1, ATTN_CFG.epochs + 1):
-        train_loss = train_one_epoch_attention(
+        train_loss, train_acc = train_one_epoch_attention(
             model, train_loader, optimizer, criterion, ATTN_CFG.device
         )
-        val_loss = validate_attention(
+        val_loss, val_acc = validate_attention(
             model, val_loader, criterion, ATTN_CFG.device
         )
-        print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+        _, val_bleu4 = evaluate_bleu_by_image_attention(
+            model,
+            val_ds,
+            vocab,
+            ATTN_CFG.device,
+            max_len=ATTN_CFG.max_len,
+            limit_images=300,
+            decode_method="greedy",
+            beam_size=ATTN_CFG.beam_size,
+        )
+        print(
+            f"Epoch {epoch:02d} | "
+            f"train_loss={train_loss:.4f} | "
+            f"train_acc={train_acc:.4f} | "
+            f"val_loss={val_loss:.4f} | "
+            f"val_acc={val_acc:.4f} | "
+            f"val_bleu4={val_bleu4:.4f}"
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_bleu4": val_bleu4,
+            }
+        )
 
-        if val_loss < best_val:
+        should_save = False
+        if val_bleu4 > best_val_bleu4 + eps:
+            should_save = True
+        elif abs(val_bleu4 - best_val_bleu4) <= eps and val_loss < best_val - eps:
+            should_save = True
+
+        if should_save:
             best_val = val_loss
+            best_val_bleu4 = val_bleu4
             ckpt = {
                 "model_state": model.state_dict(),
                 "vocab_stoi": vocab.stoi,
                 "config": ATTN_CFG.__dict__,
+                "best_val_loss": best_val,
+                "best_val_bleu4": best_val_bleu4,
+                "selection_eps": eps,
             }
             torch.save(ckpt, os.path.join(ATTN_CFG.save_dir, "best_model.pt"))
-            print("Saved best attention model")
+            print(
+                f"Saved best attention model (val_bleu4={best_val_bleu4:.4f}, "
+                f"val_loss={best_val:.4f})"
+            )
+
+    metrics_csv_path = os.path.join("outputs", "logs", "attention_train_data.csv")
+    save_training_metrics_to_csv(history, metrics_csv_path)
+    print(f"Saved training metrics to {metrics_csv_path}")
 
     best_ckpt_path = os.path.join(ATTN_CFG.save_dir, "best_model.pt")
     ckpt = torch.load(best_ckpt_path, map_location=ATTN_CFG.device)
@@ -132,6 +129,8 @@ def main():
         ATTN_CFG.device,
         max_len=ATTN_CFG.max_len,
         n=5,
+        decode_method="greedy",
+        beam_size=ATTN_CFG.beam_size,
     )
 
     print("\nTest sample predictions:")
@@ -142,6 +141,8 @@ def main():
         ATTN_CFG.device,
         max_len=ATTN_CFG.max_len,
         n=5,
+        decode_method="greedy",
+        beam_size=ATTN_CFG.beam_size,
     )
 
     val_bleu1, val_bleu4 = evaluate_bleu_by_image_attention(
@@ -151,6 +152,8 @@ def main():
         ATTN_CFG.device,
         max_len=ATTN_CFG.max_len,
         limit_images=300,
+        decode_method="greedy",
+        beam_size=ATTN_CFG.beam_size,
     )
     print(f"\nValidation BLEU-1: {val_bleu1:.4f} | BLEU-4: {val_bleu4:.4f}")
 
@@ -161,6 +164,8 @@ def main():
         ATTN_CFG.device,
         max_len=ATTN_CFG.max_len,
         limit_images=300,
+        decode_method="greedy",
+        beam_size=ATTN_CFG.beam_size,
     )
     print(f"Test BLEU-1: {test_bleu1:.4f} | BLEU-4: {test_bleu4:.4f}")
 

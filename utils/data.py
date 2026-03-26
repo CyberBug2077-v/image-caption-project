@@ -8,7 +8,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 from config import CFG
-from vocab import Vocabulary
+from utils.vocab import Vocabulary
 
 def load_image_ids(split_file: str):
     ids = set()
@@ -18,8 +18,6 @@ def load_image_ids(split_file: str):
             if line:
                 ids.add(line)
     return ids
-
-from collections import defaultdict
 
 def build_splits_from_files(
     pairs,
@@ -52,23 +50,34 @@ def build_splits_from_files(
 
 def load_caption_pairs(caption_file: str) -> List[Tuple[str, str]]:
     """
-    Expected caption file format:
-    image,caption
-    1000268201_693b08cb0e.jpg,A child in a pink dress is climbing up a set of stairs.
+    Supported caption file formats:
+    1. CSV:
+       image,caption
+       1000268201_693b08cb0e.jpg,A child in a pink dress is climbing up a set of stairs.
+    2. Flickr8k token format:
+       1000268201_693b08cb0e.jpg#0\tA child in a pink dress is climbing up a set of stairs .
     """
     pairs = []
     with open(caption_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    start = 1 if lines and lines[0].lower().startswith("image") else 0
+    start = 1 if lines and lines[0].lower().startswith("image,caption") else 0
     for line in lines[start:]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split(",", 1)
-        if len(parts) != 2:
-            continue
-        img_name, caption = parts
+
+        if "\t" in line:
+            img_name, caption = line.split("\t", 1)
+        else:
+            parts = line.split(",", 1)
+            if len(parts) != 2:
+                continue
+            img_name, caption = parts
+
+        if "#" in img_name:
+            img_name = img_name.split("#", 1)[0]
+
         pairs.append((img_name.strip(), caption.strip()))
     return pairs
 

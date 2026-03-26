@@ -1,12 +1,10 @@
 import os
 
 import torch
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
 
 from config import CFG
-from utils.vocab import set_seed, Vocabulary
-from utils.data import load_caption_pairs, build_splits, Flickr8kDataset, CollateFn
+from utils.utils import build_dataloaders, build_splits_and_vocab
+from utils.vocab import set_seed
 from models.baseline_model import ImageCaptioningModel
 from engines.baseline_engine import show_predictions, evaluate_bleu_by_image
 
@@ -16,49 +14,13 @@ def main():
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
 
-    transform = T.Compose([
-        T.Resize((CFG.image_size, CFG.image_size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    pairs = load_caption_pairs(CFG.caption_file)
-    print(f"Loaded {len(pairs)} image-caption pairs")
-
-    train_samples, val_samples, test_samples = build_splits(pairs, CFG.seed)
-
-    if CFG.debug_subset:
-        train_samples = train_samples[: CFG.debug_subset]
-        val_samples = val_samples[: min(1000, len(val_samples))]
-        test_samples = test_samples[: min(1000, len(test_samples))]
-        print(
-            f"Debug subset enabled | train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}"
-        )
-
-    train_captions = [cap for _, cap in train_samples]
-
-    vocab = Vocabulary(min_freq=CFG.min_word_freq)
-    vocab.build(train_captions)
-    print(f"Vocab size: {len(vocab)}")
-
-    val_ds = Flickr8kDataset(val_samples, CFG.image_dir, vocab, transform, CFG.max_len)
-    test_ds = Flickr8kDataset(test_samples, CFG.image_dir, vocab, transform, CFG.max_len)
-
-    collate_fn = CollateFn(pad_idx=vocab.stoi["<pad>"])
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
+    train_samples, val_samples, test_samples, vocab = build_splits_and_vocab(CFG)
+    _, val_ds, test_ds, _, val_loader, test_loader = build_dataloaders(
+        CFG,
+        vocab,
+        train_samples,
+        val_samples,
+        test_samples,
     )
 
     model = ImageCaptioningModel(CFG, vocab_size=len(vocab), use_pretrained=False).to(CFG.device)

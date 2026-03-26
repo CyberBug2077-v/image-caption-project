@@ -20,7 +20,7 @@ class Config:
     batch_size: int = 16
     num_workers: int = 0
 
-    min_word_freq: int = 5
+    min_word_freq: int = 3
     max_len: int = 30
 
     embed_dim: int = 256
@@ -30,10 +30,10 @@ class Config:
     dropout: float = 0.3
 
     lr: float = 1e-3
-    epochs: int = 3
+    epochs: int = 15
     debug_subset: int = 5000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_dir: str = "./checkpoints"
+    save_dir: str = "./outputs/checkpoints"
     seed: int = 42
     beam_size: int = 3
 
@@ -45,6 +45,7 @@ CFG = Config()
 class AttentionConfig:
     image_dir: str = "./data/Flickr8k_images"
     caption_file: str = "./data/Flickr8k_text/captions.txt"
+    vocab_path: str = "./outputs/vocab.pkl"
 
     # official split files
     train_ids_file: str = "./data/Flickr8k_text/split/Flickr_8k.trainImages.txt"
@@ -60,7 +61,7 @@ class AttentionConfig:
     batch_size: int = 16
     num_workers: int = 0
 
-    min_word_freq: int = 5
+    min_word_freq: int = 3
     max_len: int = 30
 
     embed_dim: int = 256
@@ -70,11 +71,12 @@ class AttentionConfig:
     dropout: float = 0.3
 
     lr: float = 1e-3
-    epochs: int = 5
+    epochs: int = 20
     debug_subset: int = 5000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_dir: str = "./checkpoints_attention"
+    save_dir: str = "./outputs/checkpoints_attention"
     seed: int = 42
+    beam_size: int = 3
     use_pretrained_encoder: bool = True
 
 

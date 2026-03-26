@@ -3,14 +3,27 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import torchvision.transforms as T
 
 from config import CFG
-from utils.vocab import set_seed, Vocabulary
-from utils.data import load_caption_pairs, build_splits, Flickr8kDataset, CollateFn
+from utils.utils import build_dataloaders, build_splits_and_vocab
+from utils.vocab import set_seed
 from models.baseline_model import ImageCaptioningModel
-from engines.baseline_engine import train_one_epoch, validate, show_predictions
+from engines.baseline_engine import (
+    evaluate_bleu_by_image,
+    show_predictions,
+    train_one_epoch,
+    validate,
+)
+
+
+def save_training_metrics_to_csv(history, csv_path):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    fieldnames = ["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_bleu4"]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
 
 
 def main():
@@ -19,71 +32,18 @@ def main():
     torch.set_num_interop_threads(1)
     os.makedirs(CFG.save_dir, exist_ok=True)
 
-    transform = T.Compose([
-        T.Resize((CFG.image_size, CFG.image_size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    pairs = load_caption_pairs(CFG.caption_file)
-    print(f"Loaded {len(pairs)} image-caption pairs")
-
-    train_samples, val_samples, test_samples = build_splits(pairs, CFG.seed)
-
-    if CFG.debug_subset:
-        train_samples = train_samples[: CFG.debug_subset]
-        val_samples = val_samples[: min(1000, len(val_samples))]
-        test_samples = test_samples[: min(1000, len(test_samples))]
-        print(
-            f"Debug subset enabled | train={len(train_samples)} val={len(val_samples)} test={len(test_samples)}"
-        )
-
-    train_csv_path = os.path.join("outputs", "logs", "baselline_train_data.csv")
-    save_train_samples_to_csv(train_samples, train_csv_path)
-
-    train_captions = [cap for _, cap in train_samples]
-
-    vocab = Vocabulary(min_freq=CFG.min_word_freq)
-    if os.path.exists(CFG.vocab_path):
-        print("Loading existing vocab...")
-        vocab.load(CFG.vocab_path)
-    else:
-        print("Building vocab from train data...")
-        train_captions = [c for _, c in train_samples]
-        vocab.build(train_captions)
-        vocab.save(CFG.vocab_path)
-
-    print(f"Vocab size: {len(vocab)}")
-
-    train_ds = Flickr8kDataset(train_samples, CFG.image_dir, vocab, transform, CFG.max_len)
-    val_ds = Flickr8kDataset(val_samples, CFG.image_dir, vocab, transform, CFG.max_len)
-    test_ds = Flickr8kDataset(test_samples, CFG.image_dir, vocab, transform, CFG.max_len)
-    print("Built datasets")
-
-    collate_fn = CollateFn(pad_idx=vocab.stoi["<pad>"])
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=CFG.batch_size,
-        shuffle=True,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
+    train_samples, val_samples, test_samples, vocab = build_splits_and_vocab(
+        CFG,
+        load_existing_vocab=True,
+        save_vocab=True,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
+    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = build_dataloaders(
+        CFG,
+        vocab,
+        train_samples,
+        val_samples,
+        test_samples,
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
-    )
-    print("Built loaders")
 
     model = ImageCaptioningModel(CFG, vocab_size=len(vocab)).to(CFG.device)
     print("Built model")
@@ -92,21 +52,73 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=CFG.lr)
 
     best_val = float("inf")
+    best_val_bleu4 = float("-inf")
+    eps = 1e-6
+    history = []
 
     for epoch in range(1, CFG.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, CFG.device)
-        val_loss = validate(model, val_loader, criterion, CFG.device)
-        print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            CFG.device,
+        )
+        val_loss, val_acc = validate(model, val_loader, criterion, CFG.device)
+        _, val_bleu4 = evaluate_bleu_by_image(
+            model,
+            val_ds,
+            vocab,
+            CFG.device,
+            max_len=CFG.max_len,
+            limit_images=300,
+            decode_method="greedy",
+            beam_size=CFG.beam_size,
+        )
+        print(
+            f"Epoch {epoch:02d} | "
+            f"train_loss={train_loss:.4f} | "
+            f"train_acc={train_acc:.4f} | "
+            f"val_loss={val_loss:.4f} | "
+            f"val_acc={val_acc:.4f} | "
+            f"val_bleu4={val_bleu4:.4f}"
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_bleu4": val_bleu4,
+            }
+        )
+        should_save = False
+        if val_bleu4 > best_val_bleu4 + eps:
+            should_save = True
+        elif abs(val_bleu4 - best_val_bleu4) <= eps and val_loss < best_val - eps:
+            should_save = True
 
-        if val_loss < best_val:
+        if should_save:
             best_val = val_loss
+            best_val_bleu4 = val_bleu4
             ckpt = {
                 "model_state": model.state_dict(),
                 "vocab_stoi": vocab.stoi,
                 "config": CFG.__dict__,
+                "best_val_loss": best_val,
+                "best_val_bleu4": best_val_bleu4,
+                "selection_eps": eps,
             }
             torch.save(ckpt, os.path.join(CFG.save_dir, "best_model.pt"))
-            print("Saved best model")
+            print(
+                f"Saved best model (val_bleu4={best_val_bleu4:.4f}, "
+                f"val_loss={best_val:.4f})"
+            )
+
+    metrics_csv_path = os.path.join("outputs", "logs", "baseline_train_data.csv")
+    save_training_metrics_to_csv(history, metrics_csv_path)
+    print(f"Saved training metrics to {metrics_csv_path}")
 
     best_ckpt_path = os.path.join(CFG.save_dir, "best_model.pt")
     ckpt = torch.load(best_ckpt_path, map_location=CFG.device)

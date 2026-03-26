@@ -10,9 +10,46 @@ from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from utils.vocab import tokenize
 
 
+def _token_accuracy(preds, targets):
+    predicted_tokens = preds.argmax(dim=1)
+    correct = (predicted_tokens == targets).sum().item()
+    total = targets.numel()
+    return correct, total
+
+
+@torch.no_grad()
+def generate_captions_attention(
+    model,
+    images,
+    vocab,
+    decode_method="greedy",
+    beam_size=3,
+    max_len: int = 30,
+):
+    if decode_method == "greedy":
+        return model.generate(images, vocab, max_len=max_len)
+
+    if decode_method == "beam":
+        encoder_out = model.encoder(images)
+        preds = []
+        for i in range(encoder_out.size(0)):
+            pred = model.decoder.generate_beam(
+                encoder_out[i:i + 1],
+                vocab,
+                beam_size=beam_size,
+                max_len=max_len,
+            )
+            preds.append(pred)
+        return preds
+
+    raise ValueError(f"Unknown decode_method: {decode_method}")
+
+
 def train_one_epoch_attention(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
     for images, captions, lengths, _, _ in tqdm(loader, desc="train", leave=False):
         images = images.to(device)
@@ -25,20 +62,27 @@ def train_one_epoch_attention(model, loader, optimizer, criterion, device):
         targets = pack_padded_sequence(targets, decode_lengths, batch_first=True).data
 
         loss = criterion(scores, targets)
+        correct, tokens = _token_accuracy(scores, targets)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
+        total_correct += correct
+        total_tokens += tokens
 
-    return total_loss / max(len(loader), 1)
+    avg_loss = total_loss / max(len(loader), 1)
+    avg_acc = total_correct / max(total_tokens, 1)
+    return avg_loss, avg_acc
 
 
 @torch.no_grad()
 def validate_attention(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
     for images, captions, lengths, _, _ in tqdm(loader, desc="val", leave=False):
         images = images.to(device)
@@ -52,16 +96,37 @@ def validate_attention(model, loader, criterion, device):
 
         loss = criterion(scores, targets)
         total_loss += loss.item()
+        correct, tokens = _token_accuracy(scores, targets)
+        total_correct += correct
+        total_tokens += tokens
 
-    return total_loss / max(len(loader), 1)
+    avg_loss = total_loss / max(len(loader), 1)
+    avg_acc = total_correct / max(total_tokens, 1)
+    return avg_loss, avg_acc
 
 
 @torch.no_grad()
-def show_predictions_attention(model, loader, vocab, device, max_len: int = 30, n: int = 5):
+def show_predictions_attention(
+    model,
+    loader,
+    vocab,
+    device,
+    max_len: int = 30,
+    n: int = 5,
+    decode_method="greedy",
+    beam_size=3,
+):
     model.eval()
     images, captions, lengths, raw_caps, img_names = next(iter(loader))
     images = images.to(device)
-    preds = model.generate(images, vocab, max_len=max_len)
+    preds = generate_captions_attention(
+        model,
+        images,
+        vocab,
+        decode_method=decode_method,
+        beam_size=beam_size,
+        max_len=max_len,
+    )
 
     for i in range(min(n, len(preds))):
         print("-" * 60)
@@ -78,6 +143,8 @@ def evaluate_bleu_by_image_attention(
     device,
     max_len: int = 30,
     limit_images=None,
+    decode_method="greedy",
+    beam_size=3,
 ):
     model.eval()
 
@@ -92,7 +159,7 @@ def evaluate_bleu_by_image_attention(
     references = []
     hypotheses = []
 
-    for img_name in tqdm(image_names, desc="BLEU-attention", leave=False):
+    for img_name in tqdm(image_names, desc=f"BLEU-attention-{decode_method}", leave=False):
         path = os.path.join(dataset.image_dir, img_name)
         image = Image.open(path).convert("RGB")
 
@@ -100,7 +167,14 @@ def evaluate_bleu_by_image_attention(
             image = dataset.transform(image)
 
         image = image.unsqueeze(0).to(device)
-        pred_caption = model.generate(image, vocab, max_len=max_len)[0]
+        pred_caption = generate_captions_attention(
+            model,
+            image,
+            vocab,
+            decode_method=decode_method,
+            beam_size=beam_size,
+            max_len=max_len,
+        )[0]
 
         pred_tokens = tokenize(pred_caption)
         if len(pred_tokens) == 0:

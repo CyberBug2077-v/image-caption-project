@@ -1,0 +1,11 @@
+{
+  "model": "baseline",
+  "decode": "greedy",
+  "beam_size": null,
+  "val_bleu1": 0.5247568523430592,
+  "val_bleu4": 0.14069692604729955,
+  "test_bleu1": 0.5038065382892969,
+  "test_bleu4": 0.1294030149777991,
+  "num_examples": 5,
+  "bleu_limit": 300
+}

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
 from config import AttentionConfig
@@ -153,6 +154,77 @@ class DecoderWithAttention(nn.Module):
                 generated[i].append(int(prev_words[i]))
 
         return [vocab.decode(seq) for seq in generated]
+
+    @torch.no_grad()
+    def generate_beam(
+        self,
+        encoder_out: torch.Tensor,
+        vocab,
+        beam_size: int = 3,
+        max_len: int = 30,
+    ):
+        assert encoder_out.size(0) == 1, "generate_beam only supports batch size 1"
+
+        device = encoder_out.device
+        sos_id = vocab.stoi["<sos>"]
+        eos_id = vocab.stoi["<eos>"]
+
+        h0, c0 = self.init_hidden_state(encoder_out)
+        beams = [([sos_id], 0.0, h0, c0)]
+        completed = []
+
+        def rank_key(seq, score):
+            return score / max(1, len(seq) - 1)
+
+        for _ in range(max_len):
+            candidates = []
+
+            for seq, score, h, c in beams:
+                last_token = seq[-1]
+
+                if last_token == eos_id:
+                    completed.append((seq, score))
+                    candidates.append((seq, score, h, c))
+                    continue
+
+                prev_words = torch.tensor([last_token], dtype=torch.long, device=device)
+                embeddings = self.embedding(prev_words)
+                attention_weighted_encoding, _ = self.attention(encoder_out, h)
+
+                gate = self.sigmoid(self.f_beta(h))
+                attention_weighted_encoding = gate * attention_weighted_encoding
+
+                h_new, c_new = self.decode_step(
+                    torch.cat([embeddings, attention_weighted_encoding], dim=1),
+                    (h, c),
+                )
+
+                logits = self.fc(h_new)
+                log_probs = F.log_softmax(logits, dim=-1)
+                topk_log_probs, topk_ids = torch.topk(log_probs, beam_size, dim=-1)
+
+                for k in range(beam_size):
+                    token_id = int(topk_ids[0, k].item())
+                    token_score = float(topk_log_probs[0, k].item())
+                    new_seq = seq + [token_id]
+                    new_score = score + token_score
+                    candidates.append((new_seq, new_score, h_new, c_new))
+
+            beams = sorted(
+                candidates,
+                key=lambda x: rank_key(x[0], x[1]),
+                reverse=True,
+            )[:beam_size]
+
+            if all(seq[-1] == eos_id for seq, _, _, _ in beams):
+                break
+
+        if completed:
+            best_seq, _ = max(completed, key=lambda x: rank_key(x[0], x[1]))
+        else:
+            best_seq, _, _, _ = max(beams, key=lambda x: rank_key(x[0], x[1]))
+
+        return vocab.decode(best_seq)
 
 
 class ImageCaptioningAttentionModel(nn.Module):

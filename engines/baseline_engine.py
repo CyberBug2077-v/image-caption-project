@@ -11,6 +11,8 @@ from utils.vocab import tokenize
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
     for images, captions, lengths, _, _ in tqdm(loader, desc="train", leave=False):
         images = images.to(device)
@@ -25,20 +27,27 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 
         logits = model(images, captions, lengths)
         loss = criterion(logits, targets)
+        preds = logits.argmax(dim=1)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
+        total_correct += (preds == targets).sum().item()
+        total_tokens += targets.numel()
 
-    return total_loss / max(len(loader), 1)
+    avg_loss = total_loss / max(len(loader), 1)
+    avg_acc = total_correct / max(total_tokens, 1)
+    return avg_loss, avg_acc
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
+    total_correct = 0
+    total_tokens = 0
 
     for images, captions, lengths, _, _ in tqdm(loader, desc="val", leave=False):
         images = images.to(device)
@@ -53,9 +62,14 @@ def validate(model, loader, criterion, device):
 
         logits = model(images, captions, lengths)
         loss = criterion(logits, targets)
+        preds = logits.argmax(dim=1)
         total_loss += loss.item()
+        total_correct += (preds == targets).sum().item()
+        total_tokens += targets.numel()
 
-    return total_loss / max(len(loader), 1)
+    avg_loss = total_loss / max(len(loader), 1)
+    avg_acc = total_correct / max(total_tokens, 1)
+    return avg_loss, avg_acc
 
 
 @torch.no_grad()
