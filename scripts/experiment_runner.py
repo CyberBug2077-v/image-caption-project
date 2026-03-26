@@ -531,6 +531,9 @@ def evaluate_model(
     bleu_limit,
     num_examples,
 ):
+    val_image_names, _ = build_image_references(val_ds, limit_images=None)
+    test_image_names, _ = build_image_references(test_ds, limit_images=bleu_limit)
+
     val_records = collect_predictions(
         model_name,
         model,
@@ -539,7 +542,7 @@ def evaluate_model(
         cfg,
         decode_method,
         beam_size,
-        limit_images=bleu_limit,
+        limit_images=None,
     )
     test_records = collect_predictions(
         model_name,
@@ -570,7 +573,9 @@ def evaluate_model(
         "test_cider": test_metrics["cider"],
         "test_avg_caption_length": test_metrics["avg_caption_length"],
         "num_examples": len(examples),
-        "bleu_limit": bleu_limit,
+        "val_num_images_evaluated": len(val_image_names),
+        "test_num_images_evaluated": len(test_image_names),
+        "test_bleu_limit": bleu_limit,
     }
     return metrics, examples
 

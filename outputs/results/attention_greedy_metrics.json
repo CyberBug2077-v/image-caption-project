@@ -13,5 +13,7 @@
   "test_cider": 0.33293094637595677,
   "test_avg_caption_length": 10.755,
   "num_examples": 5,
-  "bleu_limit": 300
+  "val_num_images_evaluated": 200,
+  "test_num_images_evaluated": 200,
+  "test_bleu_limit": 300
 }

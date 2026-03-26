@@ -3,7 +3,7 @@
     "model": "baseline",
     "decode": "greedy",
     "beam_size": 3,
-    "mode": "full",
+    "mode": "eval",
     "device": "cuda",
     "checkpoint": null,
     "num_examples": 5,
