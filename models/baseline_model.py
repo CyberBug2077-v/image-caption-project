@@ -72,6 +72,7 @@ class DecoderLSTM(nn.Module):
     def generate(self, features, vocab: Vocabulary, max_len: int = 30):
         batch_size = features.size(0)
         device = features.device
+        eos_id = vocab.stoi["<eos>"]
         h = self.init_h(features).unsqueeze(0)
         c = self.init_c(features).unsqueeze(0)
 
@@ -79,16 +80,31 @@ class DecoderLSTM(nn.Module):
             (batch_size, 1), vocab.stoi["<sos>"], dtype=torch.long, device=device
         )
         generated = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            emb = self.embedding(inputs[:, -1:])
-            out, (h, c) = self.lstm(emb, (h, c))
+            active = ~finished
+            if not active.any():
+                break
+
+            active_idx = active.nonzero(as_tuple=False).squeeze(1)
+            emb = self.embedding(inputs[active_idx, -1:])
+            out, (h_new, c_new) = self.lstm(
+                emb,
+                (h[:, active_idx, :], c[:, active_idx, :]),
+            )
             logits = self.fc(out.squeeze(1))
             next_token = logits.argmax(dim=-1)
-            inputs = torch.cat([inputs, next_token.unsqueeze(1)], dim=1)
 
-            for i in range(batch_size):
-                generated[i].append(int(next_token[i]))
+            inputs = torch.cat([inputs, torch.full_like(inputs[:, :1], eos_id)], dim=1)
+            inputs[active_idx, -1] = next_token
+            h[:, active_idx, :] = h_new
+            c[:, active_idx, :] = c_new
+
+            for batch_idx, token in zip(active_idx.tolist(), next_token.tolist()):
+                generated[batch_idx].append(int(token))
+                if token == eos_id:
+                    finished[batch_idx] = True
 
         return [vocab.decode(seq) for seq in generated]
 

@@ -1,0 +1,17 @@
+{
+  "model": "baseline",
+  "decode": "beam",
+  "beam_size": 3,
+  "val_bleu1": 0.5681605975723623,
+  "val_bleu4": 0.15791920252829644,
+  "val_meteor": 0.3529667158347444,
+  "val_cider": 0.39576732667475056,
+  "val_avg_caption_length": 10.71,
+  "test_bleu1": 0.5173545966228893,
+  "test_bleu4": 0.14875079182419507,
+  "test_meteor": 0.321143403327499,
+  "test_cider": 0.3443665701167632,
+  "test_avg_caption_length": 10.66,
+  "num_examples": 5,
+  "bleu_limit": 300
+}

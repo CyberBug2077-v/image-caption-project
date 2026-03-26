@@ -121,9 +121,16 @@ class DecoderWithAttention(nn.Module):
         return predictions, decode_lengths, alphas
 
     @torch.no_grad()
-    def generate(self, encoder_out: torch.Tensor, vocab, max_len: int = 30):
+    def generate(
+        self,
+        encoder_out: torch.Tensor,
+        vocab,
+        max_len: int = 30,
+        return_attention: bool = False,
+    ):
         batch_size = encoder_out.size(0)
         device = encoder_out.device
+        eos_id = vocab.stoi["<eos>"]
 
         h, c = self.init_hidden_state(encoder_out)
         prev_words = torch.full(
@@ -134,26 +141,47 @@ class DecoderWithAttention(nn.Module):
         )
 
         generated = [[] for _ in range(batch_size)]
+        attention_maps = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            embeddings = self.embedding(prev_words)
-            attention_weighted_encoding, alpha = self.attention(encoder_out, h)
+            active = ~finished
+            if not active.any():
+                break
 
-            gate = self.sigmoid(self.f_beta(h))
-            attention_weighted_encoding = gate * attention_weighted_encoding
-
-            h, c = self.decode_step(
-                torch.cat([embeddings, attention_weighted_encoding], dim=1),
-                (h, c),
+            active_idx = active.nonzero(as_tuple=False).squeeze(1)
+            embeddings = self.embedding(prev_words[active_idx])
+            attention_weighted_encoding, alpha = self.attention(
+                encoder_out[active_idx],
+                h[active_idx],
             )
 
-            scores = self.fc(h)
-            prev_words = scores.argmax(dim=1)
+            gate = self.sigmoid(self.f_beta(h[active_idx]))
+            attention_weighted_encoding = gate * attention_weighted_encoding
 
-            for i in range(batch_size):
-                generated[i].append(int(prev_words[i]))
+            h_new, c_new = self.decode_step(
+                torch.cat([embeddings, attention_weighted_encoding], dim=1),
+                (h[active_idx], c[active_idx]),
+            )
 
-        return [vocab.decode(seq) for seq in generated]
+            scores = self.fc(h_new)
+            next_words = scores.argmax(dim=1)
+            h[active_idx] = h_new
+            c[active_idx] = c_new
+            prev_words[active_idx] = next_words
+
+            for local_idx, (batch_idx, token) in enumerate(zip(active_idx.tolist(), next_words.tolist())):
+                if token == eos_id:
+                    finished[batch_idx] = True
+                    continue
+
+                generated[batch_idx].append(int(token))
+                attention_maps[batch_idx].append(alpha[local_idx].detach().cpu().tolist())
+
+        captions = [vocab.decode(seq) for seq in generated]
+        if return_attention:
+            return captions, attention_maps
+        return captions
 
     @torch.no_grad()
     def generate_beam(
@@ -162,6 +190,7 @@ class DecoderWithAttention(nn.Module):
         vocab,
         beam_size: int = 3,
         max_len: int = 30,
+        return_attention: bool = False,
     ):
         assert encoder_out.size(0) == 1, "generate_beam only supports batch size 1"
 
@@ -170,7 +199,7 @@ class DecoderWithAttention(nn.Module):
         eos_id = vocab.stoi["<eos>"]
 
         h0, c0 = self.init_hidden_state(encoder_out)
-        beams = [([sos_id], 0.0, h0, c0)]
+        beams = [([sos_id], 0.0, h0, c0, [])]
         completed = []
 
         def rank_key(seq, score):
@@ -179,17 +208,17 @@ class DecoderWithAttention(nn.Module):
         for _ in range(max_len):
             candidates = []
 
-            for seq, score, h, c in beams:
+            for seq, score, h, c, alpha_history in beams:
                 last_token = seq[-1]
 
                 if last_token == eos_id:
-                    completed.append((seq, score))
-                    candidates.append((seq, score, h, c))
+                    completed.append((seq, score, alpha_history))
+                    candidates.append((seq, score, h, c, alpha_history))
                     continue
 
                 prev_words = torch.tensor([last_token], dtype=torch.long, device=device)
                 embeddings = self.embedding(prev_words)
-                attention_weighted_encoding, _ = self.attention(encoder_out, h)
+                attention_weighted_encoding, alpha = self.attention(encoder_out, h)
 
                 gate = self.sigmoid(self.f_beta(h))
                 attention_weighted_encoding = gate * attention_weighted_encoding
@@ -208,7 +237,10 @@ class DecoderWithAttention(nn.Module):
                     token_score = float(topk_log_probs[0, k].item())
                     new_seq = seq + [token_id]
                     new_score = score + token_score
-                    candidates.append((new_seq, new_score, h_new, c_new))
+                    new_alpha_history = list(alpha_history)
+                    if token_id != eos_id:
+                        new_alpha_history.append(alpha[0].detach().cpu().tolist())
+                    candidates.append((new_seq, new_score, h_new, c_new, new_alpha_history))
 
             beams = sorted(
                 candidates,
@@ -216,15 +248,18 @@ class DecoderWithAttention(nn.Module):
                 reverse=True,
             )[:beam_size]
 
-            if all(seq[-1] == eos_id for seq, _, _, _ in beams):
+            if all(seq[-1] == eos_id for seq, _, _, _, _ in beams):
                 break
 
         if completed:
-            best_seq, _ = max(completed, key=lambda x: rank_key(x[0], x[1]))
+            best_seq, _, best_alphas = max(completed, key=lambda x: rank_key(x[0], x[1]))
         else:
-            best_seq, _, _, _ = max(beams, key=lambda x: rank_key(x[0], x[1]))
+            best_seq, _, _, _, best_alphas = max(beams, key=lambda x: rank_key(x[0], x[1]))
 
-        return vocab.decode(best_seq)
+        caption = vocab.decode(best_seq)
+        if return_attention:
+            return caption, best_alphas
+        return caption
 
 
 class ImageCaptioningAttentionModel(nn.Module):
@@ -248,6 +283,11 @@ class ImageCaptioningAttentionModel(nn.Module):
         return self.decoder(encoder_out, captions, lengths)
 
     @torch.no_grad()
-    def generate(self, images, vocab, max_len: int = 30):
+    def generate(self, images, vocab, max_len: int = 30, return_attention: bool = False):
         encoder_out = self.encoder(images)
-        return self.decoder.generate(encoder_out, vocab, max_len=max_len)
+        return self.decoder.generate(
+            encoder_out,
+            vocab,
+            max_len=max_len,
+            return_attention=return_attention,
+        )

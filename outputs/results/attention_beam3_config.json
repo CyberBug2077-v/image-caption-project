@@ -1,0 +1,42 @@
+{
+  "args": {
+    "model": "attention",
+    "decode": "beam",
+    "beam_size": 3,
+    "mode": "eval",
+    "device": "cuda",
+    "checkpoint": null,
+    "num_examples": 5,
+    "bleu_limit": 300
+  },
+  "cfg": {
+    "image_dir": "./data/Flickr8k_images",
+    "caption_file": "./data/Flickr8k_text/captions.txt",
+    "vocab_path": "./outputs/vocab.pkl",
+    "train_ids_file": "./data/Flickr8k_text/split/Flickr_8k.trainImages.txt",
+    "val_ids_file": "./data/Flickr8k_text/split/Flickr_8k.devImages.txt",
+    "test_ids_file": "./data/Flickr8k_text/split/Flickr_8k.testImages.txt",
+    "use_official_split": true,
+    "train_split": 0.8,
+    "val_split": 0.1,
+    "image_size": 224,
+    "batch_size": 16,
+    "num_workers": 0,
+    "min_word_freq": 3,
+    "max_len": 30,
+    "embed_dim": 256,
+    "decoder_dim": 512,
+    "encoder_dim": 512,
+    "attention_dim": 256,
+    "dropout": 0.3,
+    "lr": 0.001,
+    "epochs": 20,
+    "debug_subset": 5000,
+    "device": "cuda",
+    "save_dir": "./outputs/checkpoints_attention",
+    "seed": 42,
+    "beam_size": 3,
+    "use_pretrained_encoder": true
+  },
+  "experiment_name": "attention_beam3"
+}

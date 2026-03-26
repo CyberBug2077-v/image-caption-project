@@ -1,0 +1,17 @@
+{
+  "model": "attention",
+  "decode": "beam",
+  "beam_size": 3,
+  "val_bleu1": 0.5548808967772069,
+  "val_bleu4": 0.14232805206148552,
+  "val_meteor": 0.33699262602982055,
+  "val_cider": 0.38597870389037653,
+  "val_avg_caption_length": 10.705,
+  "test_bleu1": 0.5487277964474316,
+  "test_bleu4": 0.1599089525947897,
+  "test_meteor": 0.332584550211002,
+  "test_cider": 0.38538047731861674,
+  "test_avg_caption_length": 10.415,
+  "num_examples": 5,
+  "bleu_limit": 300
+}

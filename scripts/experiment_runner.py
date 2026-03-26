@@ -2,8 +2,10 @@ import argparse
 import copy
 import csv
 import json
+import math
 import os
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -11,6 +13,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 import torch.nn as nn
 from PIL import Image
+from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
+from nltk.translate.meteor_score import meteor_score
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +38,7 @@ from engines.baseline_engine import (
 from models.attention_model import ImageCaptioningAttentionModel
 from models.baseline_model import ImageCaptioningModel
 from utils.utils import build_dataloaders, build_splits_and_vocab
-from utils.vocab import set_seed
+from utils.vocab import set_seed, tokenize
 
 
 def parse_args():
@@ -62,6 +66,7 @@ def ensure_output_dirs():
         "outputs/logs",
         "outputs/results",
         "outputs/predictions",
+        "outputs/attention_maps",
     ]:
         os.makedirs(directory, exist_ok=True)
 
@@ -90,7 +95,8 @@ def get_paths(model_name, exp_name, override_checkpoint=None):
     metrics_path = os.path.join("outputs", "results", f"{exp_name}_metrics.json")
     examples_path = os.path.join("outputs", "predictions", f"{exp_name}_examples.json")
     config_path = os.path.join("outputs", "results", f"{exp_name}_config.json")
-    return checkpoint_path, log_path, metrics_path, examples_path, config_path
+    attention_maps_path = os.path.join("outputs", "attention_maps", f"{exp_name}_attention_maps.json")
+    return checkpoint_path, log_path, metrics_path, examples_path, config_path, attention_maps_path
 
 
 def save_history_to_csv(history, csv_path):
@@ -268,55 +274,249 @@ def load_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
-@torch.no_grad()
-def collect_examples(model_name, model, dataset, vocab, cfg, decode_method, beam_size, num_examples):
-    model.eval()
-    unique_samples = []
-    seen_images = set()
-
+def build_image_references(dataset, limit_images=None):
+    img_to_refs = {}
     for img_name, caption in dataset.samples:
-        if img_name in seen_images:
-            continue
-        seen_images.add(img_name)
-        unique_samples.append((img_name, caption))
-        if len(unique_samples) >= num_examples:
-            break
+        if img_name not in img_to_refs:
+            img_to_refs[img_name] = []
+        img_to_refs[img_name].append(caption)
 
-    examples = []
-    for img_name, reference in unique_samples:
+    image_names = list(img_to_refs.keys())
+    if limit_images is not None:
+        image_names = image_names[:limit_images]
+
+    return image_names, img_to_refs
+
+
+@torch.no_grad()
+def generate_prediction_for_image(model_name, model, image_tensor, vocab, cfg, decode_method, beam_size):
+    image_tensor = image_tensor.unsqueeze(0).to(cfg.device)
+
+    if model_name == "baseline":
+        features = model.encoder(image_tensor)
+        prediction = generate_captions(
+            model,
+            features,
+            vocab,
+            decode_method=decode_method,
+            beam_size=beam_size,
+            max_len=cfg.max_len,
+        )[0]
+    else:
+        prediction = generate_captions_attention(
+            model,
+            image_tensor,
+            vocab,
+            decode_method=decode_method,
+            beam_size=beam_size,
+            max_len=cfg.max_len,
+        )[0]
+
+    return prediction
+
+
+@torch.no_grad()
+def collect_predictions(model_name, model, dataset, vocab, cfg, decode_method, beam_size, limit_images=None):
+    model.eval()
+    image_names, img_to_refs = build_image_references(dataset, limit_images=limit_images)
+
+    records = []
+    for img_name in image_names:
         image = Image.open(os.path.join(dataset.image_dir, img_name)).convert("RGB")
         if dataset.transform is not None:
             image = dataset.transform(image)
 
-        image = image.unsqueeze(0).to(cfg.device)
-        if model_name == "baseline":
-            features = model.encoder(image)
-            prediction = generate_captions(
-                model,
-                features,
-                vocab,
-                decode_method=decode_method,
-                beam_size=beam_size,
-                max_len=cfg.max_len,
-            )[0]
-        else:
-            prediction = generate_captions_attention(
-                model,
-                image,
-                vocab,
-                decode_method=decode_method,
-                beam_size=beam_size,
-                max_len=cfg.max_len,
-            )[0]
-
-        examples.append(
+        prediction = generate_prediction_for_image(
+            model_name,
+            model,
+            image,
+            vocab,
+            cfg,
+            decode_method,
+            beam_size,
+        )
+        records.append(
             {
                 "image": img_name,
-                "reference": reference,
+                "references": img_to_refs[img_name],
                 "prediction": prediction,
             }
         )
+    return records
+
+
+def collect_examples(records, num_examples):
+    examples = []
+    for record in records[:num_examples]:
+        examples.append(
+            {
+                "image": record["image"],
+                "reference": record["references"][0],
+                "prediction": record["prediction"],
+            }
+        )
     return examples
+
+
+def reshape_attention(alpha):
+    if not alpha:
+        return alpha
+
+    side = int(math.sqrt(len(alpha)))
+    if side * side == len(alpha):
+        return [alpha[i * side:(i + 1) * side] for i in range(side)]
+    return alpha
+
+
+@torch.no_grad()
+def build_attention_map_records(model, dataset, examples, vocab, cfg, decode_method, beam_size):
+    attention_records = []
+
+    for example in examples:
+        image_path = os.path.join(dataset.image_dir, example["image"])
+        image = Image.open(image_path).convert("RGB")
+        if dataset.transform is not None:
+            image = dataset.transform(image)
+
+        image_tensor = image.unsqueeze(0).to(cfg.device)
+        if decode_method == "beam":
+            encoder_out = model.encoder(image_tensor)
+            prediction, alphas = model.decoder.generate_beam(
+                encoder_out,
+                vocab,
+                beam_size=beam_size,
+                max_len=cfg.max_len,
+                return_attention=True,
+            )
+        else:
+            predictions, alphas_batch = model.generate(
+                image_tensor,
+                vocab,
+                max_len=cfg.max_len,
+                return_attention=True,
+            )
+            prediction = predictions[0]
+            alphas = alphas_batch[0]
+
+        words = prediction.split()
+        attention_records.append(
+            {
+                "image_path": image_path,
+                "prediction": prediction,
+                "reference": example["reference"],
+                "words": words,
+                "alphas": [reshape_attention(alpha) for alpha in alphas[: len(words)]],
+            }
+        )
+
+    return attention_records
+
+
+def extract_ngrams(tokens, n):
+    if len(tokens) < n:
+        return Counter()
+    return Counter(tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1))
+
+
+def build_document_frequency(references_tokens):
+    document_frequency = [defaultdict(int) for _ in range(4)]
+    num_docs = 0
+
+    for refs in references_tokens:
+        for ref in refs:
+            num_docs += 1
+            for n in range(1, 5):
+                for ngram in extract_ngrams(ref, n).keys():
+                    document_frequency[n - 1][ngram] += 1
+
+    return document_frequency, max(num_docs, 1)
+
+
+def counts_to_tfidf(counts, doc_freq, num_docs):
+    vec = {}
+    for ngram, count in counts.items():
+        df = doc_freq.get(ngram, 0)
+        idf = math.log(num_docs / (1.0 + df))
+        vec[ngram] = count * max(idf, 0.0)
+    return vec
+
+
+def cosine_similarity(vec_a, vec_b):
+    if not vec_a or not vec_b:
+        return 0.0
+
+    dot = sum(value * vec_b.get(key, 0.0) for key, value in vec_a.items())
+    norm_a = math.sqrt(sum(value * value for value in vec_a.values()))
+    norm_b = math.sqrt(sum(value * value for value in vec_b.values()))
+
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def compute_cider(references_tokens, hypotheses_tokens, sigma=6.0):
+    doc_freqs, num_docs = build_document_frequency(references_tokens)
+    scores = []
+
+    for refs, hyp in zip(references_tokens, hypotheses_tokens):
+        score_per_n = []
+        for n in range(1, 5):
+            hyp_vec = counts_to_tfidf(extract_ngrams(hyp, n), doc_freqs[n - 1], num_docs)
+            sims = []
+            for ref in refs:
+                ref_vec = counts_to_tfidf(extract_ngrams(ref, n), doc_freqs[n - 1], num_docs)
+                sim = cosine_similarity(hyp_vec, ref_vec)
+                length_penalty = math.exp(-((len(hyp) - len(ref)) ** 2) / (2 * sigma * sigma))
+                sims.append(sim * length_penalty)
+
+            score_per_n.append(sum(sims) / max(len(sims), 1))
+
+        scores.append(10.0 * sum(score_per_n) / 4.0)
+
+    return sum(scores) / max(len(scores), 1)
+
+
+def compute_text_metrics(records):
+    references_tokens = []
+    hypotheses_tokens = []
+
+    for record in records:
+        refs = [tokenize(caption) for caption in record["references"]]
+        hyp = tokenize(record["prediction"])
+        if not hyp:
+            hyp = ["<unk>"]
+
+        references_tokens.append(refs)
+        hypotheses_tokens.append(hyp)
+
+    smooth = SmoothingFunction().method1
+
+    bleu1 = corpus_bleu(
+        references_tokens,
+        hypotheses_tokens,
+        weights=(1.0, 0, 0, 0),
+        smoothing_function=smooth,
+    )
+    bleu4 = corpus_bleu(
+        references_tokens,
+        hypotheses_tokens,
+        weights=(0.25, 0.25, 0.25, 0.25),
+        smoothing_function=smooth,
+    )
+    meteor = sum(
+        meteor_score(refs, hyp)
+        for refs, hyp in zip(references_tokens, hypotheses_tokens)
+    ) / max(len(hypotheses_tokens), 1)
+    cider = compute_cider(references_tokens, hypotheses_tokens)
+    avg_length = sum(len(hyp) for hyp in hypotheses_tokens) / max(len(hypotheses_tokens), 1)
+
+    return {
+        "bleu1": bleu1,
+        "bleu4": bleu4,
+        "meteor": meteor,
+        "cider": cider,
+        "avg_caption_length": avg_length,
+    }
 
 
 def evaluate_model(
@@ -331,50 +531,17 @@ def evaluate_model(
     bleu_limit,
     num_examples,
 ):
-    if model_name == "baseline":
-        val_bleu1, val_bleu4 = evaluate_bleu_by_image(
-            model,
-            val_ds,
-            vocab,
-            cfg.device,
-            max_len=cfg.max_len,
-            limit_images=bleu_limit,
-            decode_method=decode_method,
-            beam_size=beam_size,
-        )
-        test_bleu1, test_bleu4 = evaluate_bleu_by_image(
-            model,
-            test_ds,
-            vocab,
-            cfg.device,
-            max_len=cfg.max_len,
-            limit_images=bleu_limit,
-            decode_method=decode_method,
-            beam_size=beam_size,
-        )
-    else:
-        val_bleu1, val_bleu4 = evaluate_bleu_by_image_attention(
-            model,
-            val_ds,
-            vocab,
-            cfg.device,
-            max_len=cfg.max_len,
-            limit_images=bleu_limit,
-            decode_method=decode_method,
-            beam_size=beam_size,
-        )
-        test_bleu1, test_bleu4 = evaluate_bleu_by_image_attention(
-            model,
-            test_ds,
-            vocab,
-            cfg.device,
-            max_len=cfg.max_len,
-            limit_images=bleu_limit,
-            decode_method=decode_method,
-            beam_size=beam_size,
-        )
-
-    examples = collect_examples(
+    val_records = collect_predictions(
+        model_name,
+        model,
+        val_ds,
+        vocab,
+        cfg,
+        decode_method,
+        beam_size,
+        limit_images=bleu_limit,
+    )
+    test_records = collect_predictions(
         model_name,
         model,
         test_ds,
@@ -382,17 +549,26 @@ def evaluate_model(
         cfg,
         decode_method,
         beam_size,
-        num_examples,
+        limit_images=bleu_limit,
     )
+    val_metrics = compute_text_metrics(val_records)
+    test_metrics = compute_text_metrics(test_records)
+    examples = collect_examples(test_records, num_examples)
 
     metrics = {
         "model": model_name,
         "decode": decode_method,
         "beam_size": beam_size if decode_method == "beam" else None,
-        "val_bleu1": val_bleu1,
-        "val_bleu4": val_bleu4,
-        "test_bleu1": test_bleu1,
-        "test_bleu4": test_bleu4,
+        "val_bleu1": val_metrics["bleu1"],
+        "val_bleu4": val_metrics["bleu4"],
+        "val_meteor": val_metrics["meteor"],
+        "val_cider": val_metrics["cider"],
+        "val_avg_caption_length": val_metrics["avg_caption_length"],
+        "test_bleu1": test_metrics["bleu1"],
+        "test_bleu4": test_metrics["bleu4"],
+        "test_meteor": test_metrics["meteor"],
+        "test_cider": test_metrics["cider"],
+        "test_avg_caption_length": test_metrics["avg_caption_length"],
         "num_examples": len(examples),
         "bleu_limit": bleu_limit,
     }
@@ -412,7 +588,7 @@ def main():
     ensure_output_dirs()
 
     exp_name = get_experiment_name(args.model, args.decode, args.beam_size)
-    checkpoint_path, log_path, metrics_path, examples_path, config_path = get_paths(
+    checkpoint_path, log_path, metrics_path, examples_path, config_path, attention_maps_path = get_paths(
         args.model,
         exp_name,
         override_checkpoint=args.checkpoint,
@@ -484,12 +660,26 @@ def main():
         save_json(metrics, metrics_path)
         save_json(examples, examples_path)
 
+        if args.model == "attention":
+            attention_maps = build_attention_map_records(
+                model,
+                test_ds,
+                examples,
+                vocab,
+                cfg,
+                args.decode,
+                args.beam_size,
+            )
+            save_json(attention_maps, attention_maps_path)
+
         print("Evaluation metrics:")
         print(json.dumps(metrics, indent=2, ensure_ascii=False))
         print("\nQualitative examples:")
         print_examples(examples)
         print(f"\nSaved metrics to {metrics_path}")
         print(f"Saved examples to {examples_path}")
+        if args.model == "attention":
+            print(f"Saved attention maps to {attention_maps_path}")
 
 
 if __name__ == "__main__":

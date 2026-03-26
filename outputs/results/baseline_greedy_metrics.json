@@ -4,8 +4,14 @@
   "beam_size": null,
   "val_bleu1": 0.5247568523430592,
   "val_bleu4": 0.14069692604729955,
+  "val_meteor": 0.3260734684648827,
+  "val_cider": 0.34951189869136484,
+  "val_avg_caption_length": 11.31,
   "test_bleu1": 0.5038065382892969,
   "test_bleu4": 0.1294030149777991,
+  "test_meteor": 0.31761946431810484,
+  "test_cider": 0.28325133262375335,
+  "test_avg_caption_length": 11.165,
   "num_examples": 5,
   "bleu_limit": 300
 }

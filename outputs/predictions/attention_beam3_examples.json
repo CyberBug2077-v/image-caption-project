@@ -1,0 +1,27 @@
+[
+  {
+    "image": "1056338697_4f7d7ce270.jpg",
+    "reference": "A blond woman in a blue shirt appears to wait for a ride .",
+    "prediction": "a man in a red shirt is sitting on a rock wall"
+  },
+  {
+    "image": "106490881_5a2dd9b7bd.jpg",
+    "reference": "A boy in his blue swim shorts at the beach .",
+    "prediction": "a little girl in a pink dress runs along the beach"
+  },
+  {
+    "image": "1082379191_ec1e53f996.jpg",
+    "reference": "A lady and a man with no shirt sit on a dock .",
+    "prediction": "a man and a woman sitting on a bench"
+  },
+  {
+    "image": "1084040636_97d9633581.jpg",
+    "reference": "A closeup of a white dog that is laying its head on its paws .",
+    "prediction": "a white dog is running through the snow"
+  },
+  {
+    "image": "1096395242_fc69f0ae5a.jpg",
+    "reference": "A boy with a toy gun .",
+    "prediction": "a man in a blue shirt is sitting on a <unk>"
+  }
+]
